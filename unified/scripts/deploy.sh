@@ -435,6 +435,21 @@ seed_ee() {
   hub_cid="$(docker ps -q --filter "label=${hub_filter}" \
             $([[ "$RUNTIME" == compose ]] && echo --filter label=com.docker.compose.service=industream-hub-backend) \
             2>/dev/null | head -1)"
+  # Logto validates every new password against api.pwnedpasswords.com with a
+  # bare fetch() and no try/catch, so with no egress user creation answers 500 —
+  # including the first admin, which locks the console. Online sites keep the
+  # check: it works there and is a real protection.
+  #
+  # Non-fatal: the deploy has just been issued and the database may still be
+  # converging. The site is usable either way, and the script is idempotent, so
+  # a later run (or the operator's) settles it.
+  if [[ "$AIRGAP" == true ]]; then
+    echo "  ▶ airgap: disabling Logto's Have I Been Pwned password check"
+    bash "$HERE/../scripts/setup/logto-airgap-password-policy.sh" >/dev/null 2>&1 \
+      && echo "  ✓ Logto: Have I Been Pwned check disabled on every tenant" \
+      || echo "  ⚠ could not disable the Have I Been Pwned check — run scripts/setup/logto-airgap-password-policy.sh once Logto is up"
+  fi
+
   [[ -z "$hub_cid" ]] && { echo "  ⚠ hub-backend container not found — skipping seeders" >&2; return 0; }
 
   # logto-postgres must accept connections (compose `up -d` returns before ready).
