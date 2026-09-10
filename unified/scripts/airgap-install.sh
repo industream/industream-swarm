@@ -222,8 +222,24 @@ sync_tree() {
 
   # The checkout is knowingly detached from origin: offline it will never take
   # another `git pull`, so record what it actually holds.
+  # The Forge reference, when the bundle came from one — "which Forge bundle is
+  # this site running" is the first question asked of a misbehaving site, and
+  # the bundle directory name does not answer it.
+  local forge=""
+  forge="$(python3 -c "
+import json,sys
+f=json.load(open(sys.argv[1])).get('forge')
+print('%s@%s' % (f['exportKey'], f['version']) if f else '')
+" "$BUNDLE/bundle.json" 2>/dev/null)" || forge=""
+
   printf 'commit=%s\nbundle=%s\ninstalled=%s\n' \
     "$(json_get commit)" "$(basename "$BUNDLE")" "$(date -Is)" > "$TARGET/AIRGAP_VERSION"
+  # An `if`, not `[[ … ]] && …`: this is the function's last command, and the
+  # && form returns 1 for a non-Forge bundle, which `set -e` turns into a
+  # failed install.
+  if [[ -n "$forge" ]]; then
+    printf 'forge=%s\n' "$forge" >> "$TARGET/AIRGAP_VERSION"
+  fi
 }
 
 # Removes exactly the tree paths a PREVIOUS bundle delivered and this one no

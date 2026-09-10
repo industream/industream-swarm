@@ -87,6 +87,45 @@ silently harvests from (or reports empty against) the wrong volumes.
 > a box from a site installed this way, treat "the packages are present" and
 > "the boxes resolve" as two different claims.
 
+### Custom images: the bundle only sees what the BUILD machine sees
+
+`prepare` resolves the image set from the compose files — `base/`, `runtime/`
+**and `custom/*.yml`** — on the machine it runs on, then for each image uses
+the local one if `docker image inspect` finds it, and pulls otherwise.
+
+So an image that exists **only on the site's server** is not in the bundle, and
+cannot be: the build machine never sees it.
+
+That matters because the site's `custom/*.yml` **survive an update** — they are
+site-local state the sync preserves. Afterwards `deploy.sh` loads them and
+deploys those services with `--resolve-image never` against no registry, so
+every service whose image is not in the bundle fails to start.
+
+Before building, on the connected machine:
+
+```bash
+# the site's custom overlays, so prepare resolves their images at all
+scp -r <site>:/opt/industream-platform/unified/custom/*.yml unified/custom/
+
+# the images themselves, if they were built on site and never pushed
+ssh <site> 'docker save my-image:tag | zstd -T0' > img.tar.zst
+zstd -dc img.tar.zst | docker load
+```
+
+Files dropped in `custom/` do not block the build — the clean-tree gate ignores
+untracked files. They do not travel in the tree either (`git archive` skips
+them), which is right: the site already has its own.
+
+→ **verify:** the image is in the bundle's own manifest, not merely on the
+build machine:
+
+```bash
+grep -c 'my-image' <bundle>/bundle.json     # must be >= 1
+```
+
+Deduced from the code and not yet exercised end to end — hence the `grep`,
+which settles it in five seconds before the bundle leaves.
+
 ### Grafana plugin version bumps
 
 If a bundle bumps `GRAFANA_DATABRIDGE_PLUGIN` (or any preinstalled plugin

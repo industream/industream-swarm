@@ -28,6 +28,7 @@ MAX_PART_SIZE="3800M" SKIP_IMAGES=false SKIP_ASSETS=false
 # a repo with more than one release bundle checked out still resolves without
 # extra flags.
 BUNDLE="1.0.1"
+FORGE_SPEC="" FORGE_INTERACTIVE=false
 
 die() { echo "✗ $*" >&2; exit 1; }
 
@@ -56,11 +57,37 @@ parse_args() {
       # plugin harvest always uses the local daemon and ignores this flag.
       --harvest-from)   HARVEST_FROM="$2"; shift 2 ;;
       --harvest-project) HARVEST_PROJECT="$2"; shift 2 ;;
+      --forge)          FORGE_SPEC="$2"; shift 2 ;;
+      --forge-interactive) FORGE_INTERACTIVE=true; shift ;;
       --skip-images)    SKIP_IMAGES=true; shift ;;
       --skip-assets)    SKIP_ASSETS=true; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
+}
+
+# Forge is a bundle SOURCE, exactly as in deploy.sh: it materialises .env.* into
+# releases/ and sets $BUNDLE. Everything downstream is unchanged.
+resolve_forge_bundle() {
+  [[ "$FORGE_INTERACTIVE" == true || -n "$FORGE_SPEC" ]] || return 0
+  [[ "$FORGE_INTERACTIVE" == true && -n "$FORGE_SPEC" ]] \
+    && die "use --forge OR --forge-interactive, not both"
+  [[ "$BUNDLE" == "1.0.1" ]] \
+    || die "--bundle is incompatible with --forge/--forge-interactive (Forge sets the bundle)"
+
+  if [[ "$FORGE_INTERACTIVE" == true ]]; then
+    BUNDLE="$( cd "$HERE" && ./scripts/forge-bundle.sh interactive )" \
+      || die "Forge bundle selection failed"
+  else
+    # '@' splits on the LAST occurrence so an exportKey may contain one.
+    local k="${FORGE_SPEC%@*}" v="${FORGE_SPEC##*@}"
+    [[ -n "$k" && -n "$v" && "$k" != "$v" ]] \
+      || die "--forge expects <exportKey>@<version> (got '$FORGE_SPEC')"
+    BUNDLE="$( cd "$HERE" && ./scripts/forge-bundle.sh fetch "$k" "$v" )" \
+      || die "Forge bundle download failed"
+  fi
+  [[ -n "$BUNDLE" ]] || die "Forge returned no bundle key"
+  echo "▶ Forge bundle: $BUNDLE"
 }
 
 cmd_prepare() {
@@ -71,6 +98,15 @@ cmd_prepare() {
   # file a script calls would simply be absent on site.
   [[ -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]] \
     || die "working tree is dirty — commit or stash before building a bundle"
+
+  resolve_forge_bundle
+
+  # A community bundle carries no EE images. Built with --edition ee it yields a
+  # bundle whose EE services have no image, and that only surfaces at deploy
+  # time, on the far side of a USB stick.
+  ( cd "$HERE" && ./scripts/forge-bundle.sh check "$BUNDLE" --edition "$EDITION" \
+      ${GROUP_SET:+--groups "$GROUP_SET"} >/dev/null ) \
+    || die "bundle '$BUNDLE' does not satisfy --edition $EDITION — see: scripts/forge-bundle.sh check $BUNDLE --edition $EDITION"
 
   local commit; commit="$(git -C "$REPO" rev-parse --short HEAD)"
   local name="industream-airgap-${commit}-${EDITION}-${RUNTIME}"
@@ -98,8 +134,11 @@ cmd_prepare() {
   # deploy.sh sources "$BUNDLE_DIR"/.env.* and several of those are not
   # committed (the secrets hook blocks `git add` on them), so the archive alone
   # is not enough.
+  # FORGE_SOURCE rides along with the .env.*: it is the only record of WHICH
+  # Forge bundle a site runs. The bundle key cannot stand in for it — a fetch
+  # with `--name 1.0.1` produces a directory whose name says nothing.
   echo "▶ resolved bundle env files"
-  ( cd "$HERE" && find releases -name '.env.*' -type f -print0 ) \
+  ( cd "$HERE" && find releases \( -name '.env.*' -o -name FORGE_SOURCE \) -type f -print0 ) \
     | ( cd "$HERE" && xargs -0 -r -I{} cp --parents {} "$dest/tree/unified/" )
 
   local groups_args=(); [[ -n "$GROUP_SET" ]] && groups_args=(--groups "$GROUP_SET")
@@ -154,15 +193,36 @@ UNCOMPRESSED_BYTES=0
 # separately from the platform "images" list — see write_bundle_json.
 TOOLING_IMAGE=""
 
+# Reads the Forge identity out of the resolved bundle's FORGE_SOURCE, as
+# `exportKey<TAB>version`. Empty for a locally-rendered bundle.
+forge_identity() {
+  local f="$HERE/releases/bundle-platform-$BUNDLE/FORGE_SOURCE"
+  [[ -f "$f" ]] || return 0
+  local key ver
+  key="$(sed -n 's/^exportKey=//p' "$f" | head -1)"
+  ver="$(sed -n 's/^version=//p' "$f" | head -1)"
+  [[ -n "$key" && -n "$ver" ]] && printf '%s\t%s' "$key" "$ver"
+}
+
+# The heredoc below is UNQUOTED so it can interpolate the image list. Anything
+# added inside it is shell-expanded first: no backticks, no dollar signs, in
+# code or in comments. Both mistakes were made here and cost a green suite.
 write_bundle_json() {
   local dest="$1" commit="$2" images="$3" harvest_project="$4" tooling_image="$5"
-  python3 - "$dest" "$commit" "$EDITION" "$RUNTIME" "$ENV" "$GROUP_SET" "$UNCOMPRESSED_BYTES" "$BUNDLE" "$harvest_project" "$tooling_image" <<PY
+  local forge_key="" forge_version=""
+  # `read` exits non-zero on empty input and on a line with no trailing
+  # newline — both normal here, and fatal under `set -e` without the guard.
+  IFS=$'\t' read -r forge_key forge_version < <(forge_identity) || true
+  python3 - "$dest" "$commit" "$EDITION" "$RUNTIME" "$ENV" "$GROUP_SET" "$UNCOMPRESSED_BYTES" "$BUNDLE" "$harvest_project" "$tooling_image" "$forge_key" "$forge_version" <<PY
 import json, sys, datetime
-dest, commit, edition, runtime, env, groups, uncompressed, bundle, harvest_project, tooling_image = sys.argv[1:11]
+dest, commit, edition, runtime, env, groups, uncompressed, bundle, harvest_project, tooling_image, forge_key, forge_version = sys.argv[1:13]
 images = """$images""".split()
 json.dump({
     "commit": commit, "edition": edition, "runtime": runtime, "env": env,
     "groups": groups, "bundle": bundle, "harvest_project": harvest_project or None,
+    # The Forge identity, never derived from the bundle key: a fetch with
+    # --name can produce any directory name. Null for a local bundle.
+    "forge": {"exportKey": forge_key, "version": forge_version} if forge_key else None,
     "created": datetime.datetime.now().isoformat(timespec="seconds"),
     "uncompressed_bytes": int(uncompressed), "images": images,
     # Recorded separately from "images" on purpose — this is a tooling
