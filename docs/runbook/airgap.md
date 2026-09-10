@@ -151,6 +151,34 @@ first: it syncs the tree (which is what puts `create-secrets.sh` on the
 machine) and seeds the assets without attempting the deploy. Then create the
 secrets, then run `install.sh` for real.
 
+### EE only: Logto cannot create users offline until this is applied
+
+Logto checks every new password against `api.pwnedpasswords.com` with a bare
+`fetch()` and no error handling, so with no egress user creation answers 500 —
+including the **first admin user**, which locks the Admin Console entirely:
+
+```
+POST /api/experience/profile 500 5,062ms
+cause: Error: getaddrinfo EAI_AGAIN api.pwnedpasswords.com
+```
+
+Run this once on the site, after the stack is up:
+
+```bash
+scripts/setup/logto-airgap-password-policy.sh --check   # report only
+scripts/setup/logto-airgap-password-policy.sh
+```
+
+→ **verify:** every tenant reports `false`, then a real user creation logs
+`POST /api/experience/profile 204` in a few hundred ms. The multi-second
+duration is the tell that the external call is still being attempted.
+
+It writes to Logto's database, so it survives a service restart, a reboot and
+a redeploy (the entrypoint's `db seed --swe` skips an already-seeded database).
+Only recreating the `logto-postgres` volume would undo it. On a multi-node
+swarm, run it on the node hosting that task
+(`docker service ps <stack>_logto-postgres --format '{{.Node}}'`).
+
 ### The install itself
 
 ```bash
